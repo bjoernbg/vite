@@ -41,7 +41,7 @@ function warnFailedFetch(err: Error, path: string | string[]) {
 
 // Listen for messages
 socket.addEventListener('message', async ({ data }) => {
-  handleMessage(JSON.parse(data))
+  //handleMessage(JSON.parse(data))
 })
 
 let isFirstUpdate = true
@@ -222,8 +222,8 @@ async function waitForSuccessfulPing(ms = 1000) {
 socket.addEventListener('close', async ({ wasClean }) => {
   if (wasClean) return
   console.log(`[vite] server connection lost. polling for restart...`)
-  await waitForSuccessfulPing()
-  location.reload()
+  //await waitForSuccessfulPing()
+  //location.reload()
 })
 
 // https://wicg.github.io/construct-stylesheets
@@ -454,7 +454,7 @@ export const createHotContext = (ownerPath: string) => {
     invalidate() {
       // TODO should tell the server to re-perform hmr propagation
       // from this module as root
-      location.reload()
+      //location.reload()
     },
 
     // custom events

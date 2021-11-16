@@ -19,13 +19,13 @@ declare const __HMR_PORT__: string
 declare const __HMR_TIMEOUT__: number
 declare const __HMR_ENABLE_OVERLAY__: boolean
 
-console.log('[vite] NOT connecting...')
+console.log('[vite] connecting...')
 
 // use server configuration, then fallback to inference
 const socketProtocol =
   __HMR_PROTOCOL__ || (location.protocol === 'https:' ? 'wss' : 'ws')
 const socketHost = `${__HMR_HOSTNAME__ || location.hostname}:${__HMR_PORT__}`
-//const socket = new WebSocket(`${socketProtocol}://${socketHost}`, 'vite-hmr')
+const socket = new WebSocket(`${socketProtocol}://${socketHost}`, 'vite-hmr')
 const base = __BASE__ || '/'
 
 function warnFailedFetch(err: Error, path: string | string[]) {
@@ -39,7 +39,192 @@ function warnFailedFetch(err: Error, path: string | string[]) {
   )
 }
 
+// Listen for messages
+socket.addEventListener('message', async ({ data }) => {
+  handleMessage(JSON.parse(data))
+})
 
+let isFirstUpdate = true
+
+async function handleMessage(payload: HMRPayload) {
+  switch (payload.type) {
+    case 'connected':
+      console.log(`[vite] connected.`)
+      // proxy(nginx, docker) hmr ws maybe caused timeout,
+      // so send ping package let ws keep alive.
+      //setInterval(() => socket.send('ping'), __HMR_TIMEOUT__)
+      break
+    case 'update':
+      notifyListeners('vite:beforeUpdate', payload)
+      // if this is the first update and there's already an error overlay, it
+      // means the page opened with existing server compile error and the whole
+      // module script failed to load (since one of the nested imports is 500).
+      // in this case a normal update won't work and a full reload is needed.
+      if (isFirstUpdate && hasErrorOverlay()) {
+        //window.location.reload()
+        return
+      } else {
+        clearErrorOverlay()
+        isFirstUpdate = false
+      }
+      payload.updates.forEach((update) => {
+        if (update.type === 'js-update') {
+          queueUpdate(fetchUpdate(update))
+        } else {
+          // css-update
+          // this is only sent when a css file referenced with <link> is updated
+          let { path, timestamp } = update
+          path = path.replace(/\?.*/, '')
+          // can't use querySelector with `[href*=]` here since the link may be
+          // using relative paths so we need to use link.href to grab the full
+          // URL for the include check.
+          const el = (
+            [].slice.call(
+              document.querySelectorAll(`link`)
+            ) as HTMLLinkElement[]
+          ).find((e) => e.href.includes(path))
+          if (el) {
+            const newPath = `${base}${path.slice(1)}${
+              path.includes('?') ? '&' : '?'
+            }t=${timestamp}`
+            el.href = new URL(newPath, el.href).href
+          }
+          console.log(`[vite] css hot updated: ${path}`)
+        }
+      })
+      break
+    case 'custom': {
+      notifyListeners(payload.event as CustomEventName<any>, payload.data)
+      break
+    }
+    case 'full-reload':
+      notifyListeners('vite:beforeFullReload', payload)
+      if (payload.path && payload.path.endsWith('.html')) {
+        // if html file is edited, only reload the page if the browser is
+        // currently on that page.
+        const pagePath = location.pathname
+        const payloadPath = base + payload.path.slice(1)
+        if (
+          pagePath === payloadPath ||
+          (pagePath.endsWith('/') && pagePath + 'index.html' === payloadPath)
+        ) {
+          //location.reload()
+        }
+        return
+      } else {
+        //location.reload()
+      }
+      break
+    case 'prune':
+      notifyListeners('vite:beforePrune', payload)
+      // After an HMR update, some modules are no longer imported on the page
+      // but they may have left behind side effects that need to be cleaned up
+      // (.e.g style injections)
+      // TODO Trigger their dispose callbacks.
+      payload.paths.forEach((path) => {
+        const fn = pruneMap.get(path)
+        if (fn) {
+          fn(dataMap.get(path))
+        }
+      })
+      break
+    case 'error': {
+      notifyListeners('vite:error', payload)
+      const err = payload.err
+      if (enableOverlay) {
+        createErrorOverlay(err)
+      } else {
+        console.error(
+          `[vite] Internal Server Error\n${err.message}\n${err.stack}`
+        )
+      }
+      break
+    }
+    default: {
+      const check: never = payload
+      return check
+    }
+  }
+}
+
+function notifyListeners(
+  event: 'vite:beforeUpdate',
+  payload: UpdatePayload
+): void
+function notifyListeners(event: 'vite:beforePrune', payload: PrunePayload): void
+function notifyListeners(
+  event: 'vite:beforeFullReload',
+  payload: FullReloadPayload
+): void
+function notifyListeners(event: 'vite:error', payload: ErrorPayload): void
+function notifyListeners<T extends string>(
+  event: CustomEventName<T>,
+  data: any
+): void
+function notifyListeners(event: string, data: any): void {
+  const cbs = customListenersMap.get(event)
+  if (cbs) {
+    cbs.forEach((cb) => cb(data))
+  }
+}
+
+const enableOverlay = __HMR_ENABLE_OVERLAY__
+
+function createErrorOverlay(err: ErrorPayload['err']) {
+  if (!enableOverlay) return
+  clearErrorOverlay()
+  document.body.appendChild(new ErrorOverlay(err))
+}
+
+function clearErrorOverlay() {
+  document
+    .querySelectorAll(overlayId)
+    .forEach((n) => (n as ErrorOverlay).close())
+}
+
+function hasErrorOverlay() {
+  return document.querySelectorAll(overlayId).length
+}
+
+let pending = false
+let queued: Promise<(() => void) | undefined>[] = []
+
+/**
+ * buffer multiple hot updates triggered by the same src change
+ * so that they are invoked in the same order they were sent.
+ * (otherwise the order may be inconsistent because of the http request round trip)
+ */
+async function queueUpdate(p: Promise<(() => void) | undefined>) {
+  queued.push(p)
+  if (!pending) {
+    pending = true
+    await Promise.resolve()
+    pending = false
+    const loading = [...queued]
+    queued = []
+    ;(await Promise.all(loading)).forEach((fn) => fn && fn())
+  }
+}
+
+async function waitForSuccessfulPing(ms = 1000) {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await fetch(`${base}__vite_ping`)
+      break
+    } catch (e) {
+      await new Promise((resolve) => setTimeout(resolve, ms))
+    }
+  }
+}
+
+// ping server
+socket.addEventListener('close', async ({ wasClean }) => {
+  if (wasClean) return
+  console.log(`[vite] server connection lost. polling for restart...`)
+  //await waitForSuccessfulPing()
+  //location.reload()
+})
 
 // https://wicg.github.io/construct-stylesheets
 const supportsConstructedSheet = (() => {
@@ -269,7 +454,7 @@ export const createHotContext = (ownerPath: string) => {
     invalidate() {
       // TODO should tell the server to re-perform hmr propagation
       // from this module as root
-      //location.reload()
+      location.reload()
     },
 
     // custom events
